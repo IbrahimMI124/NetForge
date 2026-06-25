@@ -109,9 +109,36 @@ void ForwardingEngine::openCaptureHandles() {
 
     for (const auto& interfaceName : interfaces_) {
         char errorBuffer[PCAP_ERRBUF_SIZE] = {};
-        pcap_t* captureHandle = pcap_open_live(interfaceName.c_str(), 65535, 1, 1000, errorBuffer);
+        pcap_t* captureHandle = pcap_create(interfaceName.c_str(), errorBuffer);
         if (captureHandle == nullptr) {
             throw std::runtime_error(errorBuffer);
+        }
+
+        if (pcap_set_snaplen(captureHandle, 65535) != 0) {
+            pcap_close(captureHandle);
+            throw std::runtime_error("Failed to set snaplen");
+        }
+
+        if (pcap_set_promisc(captureHandle, 1) != 0) {
+            pcap_close(captureHandle);
+            throw std::runtime_error("Failed to set promiscuous mode");
+        }
+
+        if (pcap_set_timeout(captureHandle, 1000) != 0) {
+            pcap_close(captureHandle);
+            throw std::runtime_error("Failed to set timeout");
+        }
+
+        if (pcap_set_immediate_mode(captureHandle, 1) != 0) {
+            pcap_close(captureHandle);
+            throw std::runtime_error("Failed to set immediate mode");
+        }
+
+        const int activateResult = pcap_activate(captureHandle);
+        if (activateResult < 0) {
+            std::string err(pcap_geterr(captureHandle));
+            pcap_close(captureHandle);
+            throw std::runtime_error("Failed to activate capture handle: " + err);
         }
 
         if (pcap_datalink(captureHandle) != DLT_EN10MB) {
