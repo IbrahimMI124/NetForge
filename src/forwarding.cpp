@@ -1,15 +1,20 @@
 #include "forwarding.hpp"
 
+#include "arp.hpp"
 #include "ethernet.hpp"
 #include "ipv4.hpp"
 #include "pcap.h"
 
 #include <arpa/inet.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
+#include <net/if.h>
 #include <netinet/in.h>
-#include <sys/select.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <csignal>
@@ -24,6 +29,12 @@ namespace {
 
 // Ethernet headers are fixed at 14 bytes before the IPv4 payload begins.
 constexpr std::size_t ethernetHeaderLength = 14;
+
+// Ethernet's minimum frame size is 60 bytes (excluding the FCS the NIC appends);
+// short payloads (e.g. an ARP request) must be padded up to it.
+constexpr std::size_t minimumEthernetFrameLength = 60;
+
+constexpr std::array<std::uint8_t, 6> broadcastMac = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // Track the active router object so Ctrl+C can stop the capture loop cleanly.
 router::ForwardingEngine* g_activeEngine = nullptr;
@@ -58,30 +69,150 @@ ForwardingEngine::~ForwardingEngine() {
     }
 }
 
+void ForwardingEngine::resolveInterfaceIdentity(const std::string& interfaceName) {
+    const int helperSocket = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (helperSocket < 0) {
+        throw std::runtime_error(std::string("socket(helper): ") + std::strerror(errno));
+    }
+
+    ifreq request{};
+    std::strncpy(request.ifr_name, interfaceName.c_str(), IFNAMSIZ - 1);
+
+    InterfaceIdentity identity{};
+
+    if (::ioctl(helperSocket, SIOCGIFHWADDR, &request) < 0) {
+        const auto savedErrno = errno;
+        ::close(helperSocket);
+        throw std::runtime_error("ioctl(SIOCGIFHWADDR, " + interfaceName + "): " + std::strerror(savedErrno));
+    }
+    std::memcpy(identity.macAddress.data(), request.ifr_hwaddr.sa_data, identity.macAddress.size());
+
+    if (::ioctl(helperSocket, SIOCGIFADDR, &request) < 0) {
+        const auto savedErrno = errno;
+        ::close(helperSocket);
+        throw std::runtime_error("ioctl(SIOCGIFADDR, " + interfaceName + "): " + std::strerror(savedErrno));
+    }
+    const auto* addressIn = reinterpret_cast<sockaddr_in*>(&request.ifr_addr);
+    identity.ipAddress = ntohl(addressIn->sin_addr.s_addr);
+
+    ::close(helperSocket);
+    interfaceIdentities_.emplace(interfaceName, identity);
+}
+
 void ForwardingEngine::openTransmitSocket(const std::string& interfaceName) {
     if (transmitSockets_.contains(interfaceName)) {
         return;
     }
 
-    // Send IPv4 packets through a raw socket and let the kernel handle link-layer delivery.
-    const int transmitSocket = ::socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    // AF_PACKET + SOCK_RAW hands the kernel a complete frame we build ourselves
+    // (Ethernet header included), instead of an IP payload the kernel wraps and
+    // ARPs for on our behalf (the old IPPROTO_RAW approach).
+    const int transmitSocket = ::socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (transmitSocket < 0) {
-        throw std::runtime_error(std::string("socket: ") + std::strerror(errno));
+        throw std::runtime_error(std::string("socket(AF_PACKET): ") + std::strerror(errno));
     }
 
-    int enableHeaderInclude = 1;
-    if (::setsockopt(transmitSocket, IPPROTO_IP, IP_HDRINCL, &enableHeaderInclude, sizeof(enableHeaderInclude)) < 0) {
+    const auto interfaceIndex = ::if_nametoindex(interfaceName.c_str());
+    if (interfaceIndex == 0) {
+        const auto savedErrno = errno;
         ::close(transmitSocket);
-        throw std::runtime_error(std::string("setsockopt(IP_HDRINCL): ") + std::strerror(errno));
+        throw std::runtime_error("if_nametoindex(" + interfaceName + "): " + std::strerror(savedErrno));
     }
 
-    if (::setsockopt(transmitSocket, SOL_SOCKET, SO_BINDTODEVICE, interfaceName.c_str(),
-                     static_cast<socklen_t>(interfaceName.size() + 1U)) < 0) {
+    sockaddr_ll socketAddress{};
+    socketAddress.sll_family = AF_PACKET;
+    socketAddress.sll_protocol = htons(ETH_P_ALL);
+    socketAddress.sll_ifindex = static_cast<int>(interfaceIndex);
+
+    if (::bind(transmitSocket, reinterpret_cast<sockaddr*>(&socketAddress), sizeof(socketAddress)) < 0) {
+        const auto savedErrno = errno;
         ::close(transmitSocket);
-        throw std::runtime_error(std::string("setsockopt(SO_BINDTODEVICE): ") + std::strerror(errno));
+        throw std::runtime_error(std::string("bind(AF_PACKET): ") + std::strerror(savedErrno));
     }
 
     transmitSockets_.emplace(interfaceName, transmitSocket);
+}
+
+bool ForwardingEngine::sendEthernetFrame(const std::string& interfaceName,
+                                         const std::array<std::uint8_t, 6>& destinationMac, std::uint16_t etherType,
+                                         const std::uint8_t* payload, std::size_t payloadLength) {
+    const auto transmitSocketIter = transmitSockets_.find(interfaceName);
+    const auto identityIter = interfaceIdentities_.find(interfaceName);
+    if (transmitSocketIter == transmitSockets_.end() || identityIter == interfaceIdentities_.end()) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> frame(ethernetHeaderLength + payloadLength);
+    std::copy_n(destinationMac.begin(), destinationMac.size(), frame.begin());
+    std::copy_n(identityIter->second.macAddress.begin(), identityIter->second.macAddress.size(), frame.begin() + 6);
+    frame[12] = static_cast<std::uint8_t>(etherType >> 8U);
+    frame[13] = static_cast<std::uint8_t>(etherType & 0xFFU);
+    std::copy_n(payload, payloadLength, frame.begin() + static_cast<std::ptrdiff_t>(ethernetHeaderLength));
+
+    if (frame.size() < minimumEthernetFrameLength) {
+        frame.resize(minimumEthernetFrameLength, 0U);
+    }
+
+    const auto interfaceIndex = ::if_nametoindex(interfaceName.c_str());
+    sockaddr_ll socketAddress{};
+    socketAddress.sll_family = AF_PACKET;
+    socketAddress.sll_protocol = htons(etherType);
+    socketAddress.sll_ifindex = static_cast<int>(interfaceIndex);
+    socketAddress.sll_halen = static_cast<unsigned char>(destinationMac.size());
+    std::copy_n(destinationMac.begin(), destinationMac.size(), socketAddress.sll_addr);
+
+    const auto bytesSent = ::sendto(transmitSocketIter->second, frame.data(), frame.size(), 0,
+                                    reinterpret_cast<sockaddr*>(&socketAddress), sizeof(socketAddress));
+    return bytesSent >= 0 && static_cast<std::size_t>(bytesSent) == frame.size();
+}
+
+void ForwardingEngine::sendArpRequest(const std::string& interfaceName, std::uint32_t targetAddress) {
+    const auto identityIter = interfaceIdentities_.find(interfaceName);
+    if (identityIter == interfaceIdentities_.end()) {
+        return;
+    }
+
+    ArpPacket request;
+    request.operation = ArpOperation::Request;
+    request.senderMac = identityIter->second.macAddress;
+    request.senderIp = identityIter->second.ipAddress;
+    request.targetMac = {};
+    request.targetIp = targetAddress;
+
+    const auto wireForm = buildArpPacket(request);
+    sendEthernetFrame(interfaceName, broadcastMac, etherTypeArp, wireForm.data(), wireForm.size());
+}
+
+void ForwardingEngine::handleArpPacket(const std::string& incomingInterface, const std::uint8_t* arpData,
+                                       std::size_t length) {
+    const auto arpPacket = parseArpPacket(arpData, length);
+    if (!arpPacket.has_value()) {
+        return;
+    }
+
+    // Learn the sender's mapping opportunistically -- both requests and replies carry
+    // it, and a real ARP cache accepts either as free information rather than making
+    // a fresh request later.
+    arpCache_.insert(arpPacket->senderIp, arpPacket->senderMac);
+
+    if (arpPacket->operation != ArpOperation::Request) {
+        return;
+    }
+
+    const auto identityIter = interfaceIdentities_.find(incomingInterface);
+    if (identityIter == interfaceIdentities_.end() || arpPacket->targetIp != identityIter->second.ipAddress) {
+        return;
+    }
+
+    ArpPacket reply;
+    reply.operation = ArpOperation::Reply;
+    reply.senderMac = identityIter->second.macAddress;
+    reply.senderIp = identityIter->second.ipAddress;
+    reply.targetMac = arpPacket->senderMac;
+    reply.targetIp = arpPacket->senderIp;
+
+    const auto wireForm = buildArpPacket(reply);
+    sendEthernetFrame(incomingInterface, arpPacket->senderMac, etherTypeArp, wireForm.data(), wireForm.size());
 }
 
 std::uint16_t ForwardingEngine::computeIpv4HeaderChecksum(const std::uint8_t* header, std::size_t headerLength) {
@@ -146,6 +277,11 @@ void ForwardingEngine::openCaptureHandles() {
             throw std::runtime_error("This tool currently supports only Ethernet captures (DLT_EN10MB)");
         }
 
+        // We now transmit through this same interface via a raw AF_PACKET socket;
+        // without this, promiscuous capture would loop our own ARP/IPv4 sends back
+        // in as if they were received traffic.
+        pcap_setdirection(captureHandle, PCAP_D_IN);
+
         if (pcap_setnonblock(captureHandle, 1, errorBuffer) < 0) {
             pcap_close(captureHandle);
             throw std::runtime_error(errorBuffer);
@@ -187,6 +323,7 @@ bool ForwardingEngine::pollCaptureSource(CaptureSource& captureSource) {
 void ForwardingEngine::run() {
     openCaptureHandles();
     for (const auto& interfaceName : interfaces_) {
+        resolveInterfaceIdentity(interfaceName);
         openTransmitSocket(interfaceName);
     }
 
@@ -214,26 +351,27 @@ void ForwardingEngine::run() {
     g_shouldStop = 0;
 }
 
-void ForwardingEngine::packetHandler(u_char* userData, const pcap_pkthdr* header, const u_char* packet) {
-    auto* context = reinterpret_cast<PacketContext*>(userData);
-    if (context != nullptr && context->engine != nullptr) {
-        context->engine->handlePacket(context->interfaceName, header, packet);
-    }
-}
-
 void ForwardingEngine::handlePacket(const std::string& incomingInterface, const pcap_pkthdr* header,
                                     const u_char* packet) {
     const auto ethernetFrame = parseEthernetFrame(reinterpret_cast<const std::uint8_t*>(packet), header->caplen);
-    if (!ethernetFrame.has_value() || ethernetFrame->etherType != etherTypeIpv4) {
+    if (!ethernetFrame.has_value() || header->caplen < ethernetHeaderLength) {
         return;
     }
 
-    if (header->caplen < ethernetHeaderLength) {
+    const auto* payload = reinterpret_cast<const std::uint8_t*>(packet + ethernetHeaderLength);
+    const std::size_t payloadLength = header->caplen - ethernetHeaderLength;
+
+    if (ethernetFrame->etherType == etherTypeArp) {
+        handleArpPacket(incomingInterface, payload, payloadLength);
         return;
     }
 
-    const auto* ipv4Start = reinterpret_cast<const std::uint8_t*>(packet + ethernetHeaderLength);
-    const auto ipv4Packet = parseIpv4Packet(ipv4Start, header->caplen - ethernetHeaderLength);
+    if (ethernetFrame->etherType != etherTypeIpv4) {
+        return;
+    }
+
+    const auto* ipv4Start = payload;
+    const auto ipv4Packet = parseIpv4Packet(ipv4Start, payloadLength);
     if (!ipv4Packet.has_value()) {
         return;
     }
@@ -264,11 +402,11 @@ void ForwardingEngine::handlePacket(const std::string& incomingInterface, const 
     }
 
     const auto headerLengthBytes = static_cast<std::size_t>(ipv4Packet->headerLength) * 4U;
-    if (headerLengthBytes < 20U || header->caplen < ethernetHeaderLength + headerLengthBytes) {
+    if (headerLengthBytes < 20U || payloadLength < headerLengthBytes) {
         return;
     }
 
-    std::vector<std::uint8_t> forwardedPacket(ipv4Start, ipv4Start + (header->caplen - ethernetHeaderLength));
+    std::vector<std::uint8_t> forwardedPacket(ipv4Start, ipv4Start + payloadLength);
     auto* forwardedHeader = forwardedPacket.data();
 
     const std::uint8_t ttlBefore = forwardedHeader[8];
@@ -292,24 +430,10 @@ void ForwardingEngine::handlePacket(const std::string& incomingInterface, const 
     forwardedHeader[10] = static_cast<std::uint8_t>(checksum >> 8U);
     forwardedHeader[11] = static_cast<std::uint8_t>(checksum & 0xFFU);
 
-    const auto transmitSocketIter = transmitSockets_.find(matchedRoute->interfaceName);
-    if (transmitSocketIter == transmitSockets_.end()) {
-        std::cout << "Received packet\n";
-        std::cout << "Incoming:\n" << incomingInterface << "\n\n";
-        std::cout << "Src:\n" << ipv4Packet->sourceAddress << "\n\n";
-        std::cout << "Dst:\n" << ipv4Packet->destinationAddress << "\n\n";
-        std::cout << "Matched:\n" << formatCidrBlock(matchedRoute->network, matchedRoute->mask) << "\n\n";
-        std::cout << "Outgoing:\n" << matchedRoute->interfaceName << "\n\n";
-        std::cout << "Dropped: no transmit socket\n\n";
-        return;
-    }
-
-    sockaddr_in destination{};
-    destination.sin_family = AF_INET;
-    destination.sin_addr.s_addr = htonl(matchedRoute->nextHop != 0U ? matchedRoute->nextHop : destinationAddress);
-
-    const auto bytesSent = ::sendto(transmitSocketIter->second, forwardedPacket.data(), forwardedPacket.size(), 0,
-                                    reinterpret_cast<sockaddr*>(&destination), sizeof(destination));
+    // The next hop we need a MAC for: an explicit gateway if the route has one,
+    // otherwise the destination itself is on the egress link (directly connected).
+    const std::uint32_t nextHopAddress = matchedRoute->nextHop != 0U ? matchedRoute->nextHop : destinationAddress;
+    const auto resolvedMac = arpCache_.lookup(nextHopAddress);
 
     std::cout << "Received packet\n";
     std::cout << "Incoming:\n" << incomingInterface << "\n\n";
@@ -319,7 +443,15 @@ void ForwardingEngine::handlePacket(const std::string& incomingInterface, const 
     std::cout << "Outgoing:\n" << matchedRoute->interfaceName << "\n\n";
     std::cout << "TTL:\n" << static_cast<int>(ttlBefore) << " -> " << static_cast<int>(ttlBefore - 1U) << "\n\n";
 
-    if (bytesSent < 0) {
+    if (!resolvedMac.has_value()) {
+        sendArpRequest(matchedRoute->interfaceName, nextHopAddress);
+        std::cout << "Dropped: no ARP entry for next hop, request sent\n\n";
+        return;
+    }
+
+    const bool sent = sendEthernetFrame(matchedRoute->interfaceName, *resolvedMac, etherTypeIpv4,
+                                        forwardedPacket.data(), forwardedPacket.size());
+    if (!sent) {
         std::cout << "Dropped: transmit failed\n\n";
         return;
     }

@@ -1,4 +1,4 @@
-# VirtualRouter
+# NetForge
 
 A minimal software router in modern C++ that captures Ethernet frames on Linux, performs IPv4 longest-prefix matching, and forwards packets between interfaces with libpcap and raw IPv4 sockets.
 

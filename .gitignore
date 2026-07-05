@@ -35,3 +35,15 @@ router
 CMakeSettings.json
 CMakeUserPresets.json
 build/
+
+# Personal study material — split copy of the Kurose & Ross textbook, not part
+# of the project. Used as a reference when writing STUDY_GUIDE.md (see
+# ComputerNetworking_tree/NETFORGE_STUDY_MAP.md).
+ComputerNetworking_tree/
+
+# Process/study docs — personal working notes for this project, not part of the
+# router itself. CLAUDE.md stays tracked (it's shared project instruction).
+PROJECT_STATE.md
+STUDY_GUIDE.md
+STUDY_GUIDE_v2.md
+CLAUDE.md

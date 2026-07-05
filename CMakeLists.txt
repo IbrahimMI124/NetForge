@@ -13,15 +13,32 @@ add_executable(router
     src/ipv4.cpp
     src/routing.cpp
     src/forwarding.cpp
+    src/arp.cpp
 )
 
 target_include_directories(router PRIVATE src)
 
-set(PCAP_LIBRARY_PATH /usr/lib/x86_64-linux-gnu/libpcap.so.1.10.4)
-if(NOT EXISTS ${PCAP_LIBRARY_PATH})
-    message(FATAL_ERROR "libpcap shared library not found at ${PCAP_LIBRARY_PATH}")
+# Only the runtime library is needed — src/pcap.h vendors the handful of
+# declarations this project uses, so no libpcap-dev headers are required.
+# find_library() alone only finds the unversioned "libpcap.so" symlink that
+# ships with libpcap-dev; fall back to globbing for the versioned runtime
+# .so (e.g. libpcap.so.1.10.4) that a plain libpcap install provides.
+find_library(PCAP_LIBRARY NAMES pcap)
+if(NOT PCAP_LIBRARY)
+    file(GLOB PCAP_VERSIONED_CANDIDATES
+        /usr/lib/*/libpcap.so.*
+        /usr/lib/libpcap.so.*
+        /usr/local/lib/libpcap.so.*
+    )
+    if(PCAP_VERSIONED_CANDIDATES)
+        list(GET PCAP_VERSIONED_CANDIDATES 0 PCAP_LIBRARY)
+    endif()
 endif()
 
-target_link_libraries(router PRIVATE ${PCAP_LIBRARY_PATH})
+if(NOT PCAP_LIBRARY)
+    message(FATAL_ERROR "libpcap runtime library not found. Install libpcap (e.g. libpcap0.8) or libpcap-dev.")
+endif()
+
+target_link_libraries(router PRIVATE ${PCAP_LIBRARY})
 
 target_compile_options(router PRIVATE -Wall -Wextra -Wpedantic)

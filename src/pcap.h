@@ -34,6 +34,12 @@ typedef struct pcap_if {
     unsigned int flags;
 } pcap_if_t;
 
+typedef enum {
+    PCAP_D_INOUT = 0,
+    PCAP_D_IN,
+    PCAP_D_OUT
+} pcap_direction_t;
+
 #define PCAP_ERRBUF_SIZE 256
 #define PCAP_IF_LOOPBACK 0x00000001U
 #define PCAP_IF_UP 0x00000002U
@@ -53,6 +59,7 @@ int pcap_loop(pcap_t* p, int cnt, pcap_handler callback, u_char* user);
 int pcap_dispatch(pcap_t* p, int cnt, pcap_handler callback, u_char* user);
 int pcap_next_ex(pcap_t* p, struct pcap_pkthdr** header, const u_char** data);
 int pcap_setnonblock(pcap_t* p, int nonblock, char* errbuf);
+int pcap_setdirection(pcap_t* p, pcap_direction_t d);
 int pcap_get_selectable_fd(pcap_t* p);
 int pcap_breakloop(pcap_t* p);
 int pcap_findalldevs(pcap_if_t** alldevs, char* errbuf);
