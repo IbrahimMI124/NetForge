@@ -12,17 +12,20 @@ constexpr std::uint8_t arpHardwareAddressLength = 6;
 constexpr std::uint8_t arpProtocolAddressLength = 4;
 constexpr std::size_t arpPacketLength = 28;
 
-// Short TTL relative to a real host's ARP cache (K&R notes ~20 min typical) so cache
-// expiry is easy to observe/exercise in this lab rather than waiting.
-constexpr std::chrono::seconds arpCacheTtl{60};
+// Temporary: shortened to 5s for testing expiry behavior (normally 60s, see PROJECT_STATE.md).
+// Drop back to 60 once cache expiry is confirmed working.
+constexpr std::chrono::seconds arpCacheTtl{5};
 
 }  // namespace
 
 std::optional<ArpPacket> parseArpPacket(const std::uint8_t* data, std::size_t length) {
+    // Reject truncated payloads before reading any fixed fields.
     if (data == nullptr || length < arpPacketLength) {
         return std::nullopt;
     }
 
+    // Only accept the one hardware/protocol combination this router understands:
+    // Ethernet (type 1) carrying IPv4 (type 0x0800) addresses.
     const auto hardwareType = static_cast<std::uint16_t>((data[0] << 8U) | data[1]);
     const auto protocolType = static_cast<std::uint16_t>((data[2] << 8U) | data[3]);
     const auto hardwareLength = data[4];
@@ -34,11 +37,15 @@ std::optional<ArpPacket> parseArpPacket(const std::uint8_t* data, std::size_t le
         return std::nullopt;
     }
 
+    // Only request/reply are defined operations we act on (RFC 826 also permits
+    // RARP-style codes we have no use for here).
     if (operation != static_cast<std::uint16_t>(ArpOperation::Request) &&
         operation != static_cast<std::uint16_t>(ArpOperation::Reply)) {
         return std::nullopt;
     }
 
+    // Sender/target MAC and IP occupy fixed byte ranges after the 8-byte header;
+    // addresses are big-endian on the wire, hence the manual shift-and-OR.
     ArpPacket packet;
     packet.operation = static_cast<ArpOperation>(operation);
     std::copy_n(data + 8, packet.senderMac.size(), packet.senderMac.begin());
@@ -54,6 +61,8 @@ std::optional<ArpPacket> parseArpPacket(const std::uint8_t* data, std::size_t le
 std::array<std::uint8_t, 28> buildArpPacket(const ArpPacket& packet) {
     std::array<std::uint8_t, arpPacketLength> data{};
 
+    // Fixed header: hardware/protocol type and address-length fields never vary
+    // for the Ethernet/IPv4 case this router speaks.
     data[0] = static_cast<std::uint8_t>(arpHardwareTypeEthernet >> 8U);
     data[1] = static_cast<std::uint8_t>(arpHardwareTypeEthernet & 0xFFU);
     data[2] = static_cast<std::uint8_t>(arpProtocolTypeIpv4 >> 8U);
@@ -65,6 +74,8 @@ std::array<std::uint8_t, 28> buildArpPacket(const ArpPacket& packet) {
     data[6] = static_cast<std::uint8_t>(operation >> 8U);
     data[7] = static_cast<std::uint8_t>(operation & 0xFFU);
 
+    // Mirror of parseArpPacket's layout: sender fields, then target fields, IPs
+    // written big-endian to match the wire format.
     std::copy_n(packet.senderMac.begin(), packet.senderMac.size(), data.begin() + 8);
     data[14] = static_cast<std::uint8_t>(packet.senderIp >> 24U);
     data[15] = static_cast<std::uint8_t>(packet.senderIp >> 16U);

@@ -36,6 +36,16 @@ constexpr std::size_t minimumEthernetFrameLength = 60;
 
 constexpr std::array<std::uint8_t, 6> broadcastMac = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+// Cap how many packets we'll hold for one unresolved next hop so a persistently
+// unreachable destination can't grow the queue without bound.
+constexpr std::size_t maxQueuedPacketsPerResolution = 4;
+
+// Re-request on a fixed interval rather than once per queued packet, and give up
+// (dropping whatever's queued) after this many attempts elicit no reply --
+// mirrors a real neighbor cache's bounded retry/incomplete-entry behavior.
+constexpr std::chrono::milliseconds arpRetryInterval{1000};
+constexpr int maxArpRetries = 3;
+
 // Track the active router object so Ctrl+C can stop the capture loop cleanly.
 router::ForwardingEngine* g_activeEngine = nullptr;
 volatile std::sig_atomic_t g_shouldStop = 0;
@@ -70,6 +80,9 @@ ForwardingEngine::~ForwardingEngine() {
 }
 
 void ForwardingEngine::resolveInterfaceIdentity(const std::string& interfaceName) {
+    // ioctl needs some open socket to operate through; its family/type is irrelevant
+    // here since we're only asking the kernel about interface properties, not sending
+    // data on it.
     const int helperSocket = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (helperSocket < 0) {
         throw std::runtime_error(std::string("socket(helper): ") + std::strerror(errno));
@@ -80,6 +93,8 @@ void ForwardingEngine::resolveInterfaceIdentity(const std::string& interfaceName
 
     InterfaceIdentity identity{};
 
+    // SIOCGIFHWADDR fills ifr_hwaddr.sa_data with the interface's own MAC -- needed
+    // to act as the source address when we build Ethernet frames ourselves below.
     if (::ioctl(helperSocket, SIOCGIFHWADDR, &request) < 0) {
         const auto savedErrno = errno;
         ::close(helperSocket);
@@ -87,6 +102,9 @@ void ForwardingEngine::resolveInterfaceIdentity(const std::string& interfaceName
     }
     std::memcpy(identity.macAddress.data(), request.ifr_hwaddr.sa_data, identity.macAddress.size());
 
+    // SIOCGIFADDR (re-using the same ifreq) fills ifr_addr with the interface's IPv4
+    // address as configured at the OS level (e.g. by setup_lab.sh) -- this is what we
+    // answer ARP requests for and what we source our own ARP requests from.
     if (::ioctl(helperSocket, SIOCGIFADDR, &request) < 0) {
         const auto savedErrno = errno;
         ::close(helperSocket);
@@ -142,6 +160,9 @@ bool ForwardingEngine::sendEthernetFrame(const std::string& interfaceName,
         return false;
     }
 
+    // Build the 14-byte Ethernet header by hand: destination MAC first, then this
+    // interface's own MAC as the source, then the EtherType -- exactly the layout
+    // parseEthernetFrame reads on the receive side.
     std::vector<std::uint8_t> frame(ethernetHeaderLength + payloadLength);
     std::copy_n(destinationMac.begin(), destinationMac.size(), frame.begin());
     std::copy_n(identityIter->second.macAddress.begin(), identityIter->second.macAddress.size(), frame.begin() + 6);
@@ -153,6 +174,9 @@ bool ForwardingEngine::sendEthernetFrame(const std::string& interfaceName,
         frame.resize(minimumEthernetFrameLength, 0U);
     }
 
+    // sendto on an AF_PACKET/SOCK_RAW socket needs a sockaddr_ll naming the egress
+    // interface; sll_addr/sll_halen are set for completeness but the frame we wrote
+    // above (not this struct) is what actually goes out with that destination MAC.
     const auto interfaceIndex = ::if_nametoindex(interfaceName.c_str());
     sockaddr_ll socketAddress{};
     socketAddress.sll_family = AF_PACKET;
@@ -172,6 +196,8 @@ void ForwardingEngine::sendArpRequest(const std::string& interfaceName, std::uin
         return;
     }
 
+    // A request has no known target MAC yet (that's the whole point of asking) --
+    // leave it zeroed and broadcast the frame so every adapter on the segment sees it.
     ArpPacket request;
     request.operation = ArpOperation::Request;
     request.senderMac = identityIter->second.macAddress;
@@ -181,6 +207,52 @@ void ForwardingEngine::sendArpRequest(const std::string& interfaceName, std::uin
 
     const auto wireForm = buildArpPacket(request);
     sendEthernetFrame(interfaceName, broadcastMac, etherTypeArp, wireForm.data(), wireForm.size());
+}
+
+void ForwardingEngine::queuePendingForward(std::uint32_t nextHopAddress, const std::string& egressInterface,
+                                           std::vector<std::uint8_t> ipv4Packet) {
+    auto& pending = pendingArpResolutions_[nextHopAddress];
+
+    // Give up on a resolution nobody is answering rather than retrying forever;
+    // resetting it here means the packet that triggered this call starts a fresh
+    // attempt cleanly instead of being silently folded into a dead one.
+    if (pending.retryCount >= maxArpRetries &&
+        std::chrono::steady_clock::now() - pending.lastRequestAt >= arpRetryInterval) {
+        pending = PendingArpResolution{};
+    }
+
+    // Re-request on a fixed interval rather than once per packet -- every packet
+    // arriving for the same unresolved destination should share one in-flight
+    // request, not each trigger its own.
+    if (std::chrono::steady_clock::now() - pending.lastRequestAt >= arpRetryInterval) {
+        sendArpRequest(egressInterface, nextHopAddress);
+        pending.lastRequestAt = std::chrono::steady_clock::now();
+        ++pending.retryCount;
+    }
+
+    // Drop the oldest queued packet to make room rather than growing without bound
+    // for a destination that may never answer.
+    if (pending.queuedPackets.size() >= maxQueuedPacketsPerResolution) {
+        pending.queuedPackets.erase(pending.queuedPackets.begin());
+    }
+    pending.queuedPackets.push_back(PendingForward{egressInterface, std::move(ipv4Packet)});
+}
+
+void ForwardingEngine::flushPendingArpResolution(std::uint32_t ipAddress,
+                                                 const std::array<std::uint8_t, 6>& macAddress) {
+    const auto pendingIter = pendingArpResolutions_.find(ipAddress);
+    if (pendingIter == pendingArpResolutions_.end()) {
+        return;
+    }
+
+    // The MAC is now known -- send everything that was waiting on it, in the order
+    // it arrived, then forget this resolution entirely (a fresh one starts clean on
+    // the next cache miss, if the entry ever expires).
+    for (auto& queued : pendingIter->second.queuedPackets) {
+        sendEthernetFrame(queued.egressInterface, macAddress, etherTypeIpv4, queued.ipv4Packet.data(),
+                          queued.ipv4Packet.size());
+    }
+    pendingArpResolutions_.erase(pendingIter);
 }
 
 void ForwardingEngine::handleArpPacket(const std::string& incomingInterface, const std::uint8_t* arpData,
@@ -194,6 +266,7 @@ void ForwardingEngine::handleArpPacket(const std::string& incomingInterface, con
     // it, and a real ARP cache accepts either as free information rather than making
     // a fresh request later.
     arpCache_.insert(arpPacket->senderIp, arpPacket->senderMac);
+    flushPendingArpResolution(arpPacket->senderIp, arpPacket->senderMac);
 
     if (arpPacket->operation != ArpOperation::Request) {
         return;
@@ -204,6 +277,9 @@ void ForwardingEngine::handleArpPacket(const std::string& incomingInterface, con
         return;
     }
 
+    // Swap sender/target: we become the sender (our own MAC/IP), and the original
+    // sender becomes the target we're answering -- then unicast it straight back,
+    // since only the querier needs this answer.
     ArpPacket reply;
     reply.operation = ArpOperation::Reply;
     reply.senderMac = identityIter->second.macAddress;
@@ -390,6 +466,9 @@ void ForwardingEngine::handlePacket(const std::string& incomingInterface, const 
         return;
     }
 
+    // Split-horizon: never bounce a packet back out the interface it arrived on --
+    // it would mean the packet's own subnet is the best route to its destination,
+    // so the sender should have delivered it directly rather than via this router.
     if (matchedRoute->interfaceName == incomingInterface) {
         std::cout << "Received packet\n";
         std::cout << "Incoming:\n" << incomingInterface << "\n\n";
@@ -444,8 +523,8 @@ void ForwardingEngine::handlePacket(const std::string& incomingInterface, const 
     std::cout << "TTL:\n" << static_cast<int>(ttlBefore) << " -> " << static_cast<int>(ttlBefore - 1U) << "\n\n";
 
     if (!resolvedMac.has_value()) {
-        sendArpRequest(matchedRoute->interfaceName, nextHopAddress);
-        std::cout << "Dropped: no ARP entry for next hop, request sent\n\n";
+        queuePendingForward(nextHopAddress, matchedRoute->interfaceName, std::move(forwardedPacket));
+        std::cout << "Queued: no ARP entry for next hop yet, request sent\n\n";
         return;
     }
 

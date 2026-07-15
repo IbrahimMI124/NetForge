@@ -97,10 +97,14 @@ std::string formatCidrBlock(std::uint32_t network, std::uint32_t mask) {
 }
 
 void RoutingTable::addRoute(Route route) {
+    // Reject malformed masks outright rather than silently matching nothing/everything.
     if (!isContiguousMask(route.mask)) {
         return;
     }
 
+    // Normalize defensively even though parseCidrBlock already does this -- a Route
+    // can also be constructed directly (as main.cpp's demo table does), and lookup's
+    // equality check below assumes the stored network has no stray host bits set.
     route.network &= route.mask;
     routes_.push_back(std::move(route));
 }
@@ -128,10 +132,16 @@ std::optional<Route> RoutingTable::lookup(std::uint32_t destination) const {
     std::uint8_t bestPrefixLength = 0U;
 
     for (const auto& route : routes_) {
+        // Masking the destination zeroes its host bits, leaving only the network
+        // portion to compare against the route's (already-normalized) network --
+        // this is CIDR matching at the bit level.
         if ((destination & route.mask) != route.network) {
             continue;
         }
 
+        // Don't stop at the first match: multiple routes can legally overlap (e.g.
+        // 10.0.0.0/8 and 10.0.0.0/24 both matching 10.0.0.5), and the one with the
+        // most "must-match" bits -- the longest prefix -- is the correct answer.
         const auto prefixLength = prefixLengthFromMask(route.mask);
         if (!bestRoute.has_value() || prefixLength > bestPrefixLength) {
             bestRoute = route;
